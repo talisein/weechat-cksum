@@ -28,6 +28,7 @@
 
 #define LOCAL   __attribute__ ((visibility ("hidden")))
 #define EXTERN  __attribute__ ((visibility ("default")))
+#define XFER_STATUS_DONE 3
 #define CKSUM_PREFIX "cksum: "
 
 EXTERN char weechat_plugin_name[]        = "cksum";
@@ -548,7 +549,8 @@ on_cksum_recv(const char* nick, char* md5, cksum_globals_t *globals)
 	while ( weechat_infolist_next(infolist) ) {
 		/* Match xfer to remote_nick */
 		const char* remote_nick = weechat_infolist_string(infolist, "remote_nick");
-		if (strcmp(remote_nick, nick) == 0) {
+		const int status = weechat_infolist_integer(infolist, "status");
+		if ( status == XFER_STATUS_DONE && strcmp(remote_nick, nick) == 0) {
 			/* Create cksum_ctx and start hashing */
 			const char* fn = weechat_infolist_string(infolist, "local_filename");
 			cksum_ctx_t *ctx = cksum_ctx_new(globals, md5, fn);
@@ -657,7 +659,8 @@ cksum_cb_xfer_ended(void* cbdata,
 	if (crc32) {
 		while (weechat_infolist_next(infolist)) {
 			const char *filename = weechat_infolist_string(infolist, "filename");
-			if (strcmp(filename, sig_filename) == 0) {
+			int status = weechat_infolist_integer(infolist, "status");
+			if (status == XFER_STATUS_DONE && strcmp(filename, sig_filename) == 0) {
 				/* Match found, create new cksum_xfer and hash in 5 seconds */
 				const char *fn = weechat_infolist_string(infolist, "local_filename");
 				if (fn) {
