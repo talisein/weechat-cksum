@@ -25,31 +25,49 @@
 #include <unistd.h>
 #include <gcrypt.h>
 #include <stdbool.h>
+#include <limits.h>
+#include <stdint.h>
+#include <sys/param.h>
 
-#define LOCAL   __attribute__ ((visibility ("hidden")))
 #define EXTERN  __attribute__ ((visibility ("default")))
 #define XFER_STATUS_DONE 3
 #define CKSUM_PREFIX "cksum: "
 
-EXTERN char weechat_plugin_name[]        = "cksum";
-EXTERN char weechat_plugin_api_version[] = WEECHAT_PLUGIN_API_VERSION;
-EXTERN char weechat_plugin_author[]      = "talisein";
-EXTERN char weechat_plugin_description[] = "Performs checksum validation after DCC file xfer";
-EXTERN char weechat_plugin_version[]     = "0.9.0";
-EXTERN char weechat_plugin_license[]     = "GPL3";
+#define CANON_ELEMENT(c) c
+#define AVAILABLE(h, h_l, j, n_l)			\
+  (!memchr ((h) + (h_l), '\0', (j) + (n_l) - (h_l))	\
+   && ((h_l) = (j) + (n_l)))
+#define CMP_FUNC(p1, p2, l)				\
+  strncmp ((const char *) (p1), (const char *) (p2), l)
+
+EXTERN const char weechat_plugin_name[]        = "cksum";
+EXTERN const char weechat_plugin_api_version[] = WEECHAT_PLUGIN_API_VERSION;
+EXTERN const char weechat_plugin_author[]      = "talisein";
+EXTERN const char weechat_plugin_description[] = "Performs checksum validation after DCC file xfer";
+EXTERN const char weechat_plugin_version[]     = "0.10.1";
+EXTERN const char weechat_plugin_license[]     = "GPL3";
 
 typedef struct {
-	struct t_hashtable *xfers;
-	struct t_hook      *hook_print;
-	struct t_hook      *hook_xfer_ended;
-	regex_t            *re_tx_complete;
-	regex_t            *re_md5;
-	regex_t            *re_nick;
-	regex_t            *re_crc32;
-	char               *ebuf;
-	size_t              elen;
-	unsigned char      *buf;
-	size_t              len;
+	size_t *shift_table;
+	const char *needle;
+	size_t needle_len;
+	size_t suffix;
+	size_t period;
+} cksum_strstr_ctx_t;
+
+typedef struct {
+	struct t_hashtable    *xfers;
+	struct t_hook         *hook_print;
+	struct t_hook         *hook_xfer_ended;
+	regex_t               *re_tx_complete;
+	regex_t               *re_md5;
+	regex_t               *re_nick;
+	regex_t               *re_crc32;
+	char                  *ebuf;
+	size_t                 elen;
+	unsigned char         *buf;
+	size_t                 len;
+	cksum_strstr_ctx_t *strstr_ctx;
 } cksum_globals_t;
 
 typedef struct {
@@ -70,10 +88,121 @@ typedef struct {
 	struct t_hook *timer;
 } cksum_xfer_t;
 
-struct t_weechat_plugin *weechat_plugin    = NULL;
-cksum_globals_t         *cksum_global_data = NULL;
+struct t_weechat_plugin *weechat_plugin;
+cksum_globals_t         *cksum_global_data;
 
-LOCAL cksum_xfer_t* 
+
+/*
+ * Compile a Boyer-Moore shift table. The suffix and period come from
+ * glibc's critical_factorization() in str_two_way.h
+ */
+static cksum_strstr_ctx_t*
+cksum_strstr_new(const char* needle, size_t needle_len, size_t suffix, size_t period)
+{
+	cksum_strstr_ctx_t *ctx = malloc(sizeof(cksum_strstr_ctx_t));
+	if (!ctx) return NULL;
+	size_t *shift_table = malloc(sizeof(size_t) * (1U << CHAR_BIT));
+	if (!shift_table) {
+		free(ctx);
+		return NULL;
+	}
+
+	ctx->shift_table = shift_table;
+	ctx->needle      = needle;
+	ctx->needle_len  = needle_len;
+	ctx->suffix      = suffix;
+	ctx->period      = period;
+
+	size_t i;
+	for (i = 0; i < (1U << CHAR_BIT); ++i)
+		shift_table[i] = needle_len;
+	for (i = 0; i < needle_len; ++i)
+		shift_table[(unsigned char)CANON_ELEMENT (needle[i])] = needle_len - i - 1;
+
+	return ctx;
+}
+
+static void
+cksum_strstr_free(cksum_strstr_ctx_t *ctx)
+{
+	if (ctx) {
+		if (ctx->shift_table) free (ctx->shift_table);
+		free (ctx);
+	}
+}
+
+/*
+ * Perform a Boyer-Moore substring search, using the precompiled
+ * shift_table in ctx. Implementation mostly copied from glibc.
+ */
+static char*
+cksum_strstr(const cksum_strstr_ctx_t *ctx, const char *haystack_start)
+{
+	const char   *needle_start = ctx->needle;
+	const char   *needle       = needle_start;
+	const char   *haystack     = haystack_start;
+	const size_t *shift_table  = ctx->shift_table;
+	size_t        needle_len   = ctx->needle_len;
+	size_t        suffix       = ctx->suffix;
+	size_t        period       = ctx->period;
+	bool          ok           = true;
+	size_t        j            = 0;
+	size_t        haystack_len;
+	size_t        shift;
+	size_t        i;
+
+	while (*haystack && *needle)
+		ok &= *haystack++ == *needle++;
+	if (*needle)
+		return NULL;
+	if (ok)
+		return (char*) haystack_start;
+
+	haystack = strchr (haystack_start + 1, *needle_start);
+	if (!haystack)
+		return (char *) haystack;
+	needle -= needle_len;
+	haystack_len = (haystack > haystack_start + needle_len ? 1
+	                : needle_len + haystack_start - haystack);
+
+	while (AVAILABLE (haystack, haystack_len, j, needle_len)) {
+		const char *pneedle;
+		const char *phaystack;
+
+		/* Check the last byte first; if it does not match, then
+		   shift to the next possible match location.  */
+		shift = shift_table[(unsigned char) CANON_ELEMENT (haystack[j + needle_len - 1])];
+		if (0 < shift) {
+			j += shift;
+			continue;
+		}
+
+	  /* Scan for matches in right half.  The last byte has
+	     already been matched, by virtue of the shift table.  */
+		i = suffix;
+		pneedle = &needle[i];
+		phaystack = &haystack[i + j];
+		while (i < needle_len - 1 && (CANON_ELEMENT (*pneedle++) == CANON_ELEMENT (*phaystack++)))
+			++i;
+		if (needle_len - 1 <= i) {
+			/* Scan for matches in left half.  */
+			i = suffix - 1;
+			pneedle = &needle[i];
+			phaystack = &haystack[i + j];
+			while (i != SIZE_MAX && (CANON_ELEMENT (*pneedle--) == CANON_ELEMENT (*phaystack--)))
+				--i;
+			if (i == SIZE_MAX)
+				return (char*) (haystack + j);
+			j += period;
+		} else {
+			j += i - suffix + 1;
+		}
+	}
+
+	return NULL;
+}
+
+static cksum_xfer_t*
 cksum_xfer_new(const char* filename, const char* crc32)
 {
 	cksum_xfer_t *xfer = (cksum_xfer_t*) malloc(sizeof(cksum_xfer_t));
@@ -92,7 +221,7 @@ cksum_xfer_new(const char* filename, const char* crc32)
 	return xfer;
 }
 
-LOCAL void
+static void
 cksum_xfer_free(cksum_xfer_t *xfer)
 {
 	if (xfer) {
@@ -106,7 +235,7 @@ cksum_xfer_free(cksum_xfer_t *xfer)
 	}
 }
 
-LOCAL void 
+static void
 cksum_xfers_add(cksum_xfer_t *xfer)
 {
 	if (xfer) {
@@ -117,7 +246,7 @@ cksum_xfers_add(cksum_xfer_t *xfer)
 	}
 }
 
-LOCAL void
+static void
 cksum_xfers_remove(cksum_xfer_t *xfer)
 {
 	if (xfer) {
@@ -127,7 +256,7 @@ cksum_xfers_remove(cksum_xfer_t *xfer)
 	}
 }
 
-LOCAL cksum_xfer_t*
+static cksum_xfer_t*
 cksum_xfers_find(const char* filename)
 {
 	if (filename) {
@@ -139,7 +268,8 @@ cksum_xfers_find(const char* filename)
 	return NULL;
 }
 
-LOCAL bool
+/*
+static bool
 cksum_xfers_has_xfer(const cksum_xfer_t* xfer)
 {
 	struct t_hashtable *xfers = cksum_global_data->xfers;
@@ -148,9 +278,9 @@ cksum_xfers_has_xfer(const cksum_xfer_t* xfer)
 		return true;
 	else
 		return false;
-}
+}*/
 
-LOCAL void
+static void
 cksum_xfers_remove_all_cb(void              *data      __attribute__((unused)),
                          struct t_hashtable *hashtable __attribute__((unused)),
                          const void         *key       __attribute__((unused)),
@@ -160,7 +290,7 @@ cksum_xfers_remove_all_cb(void              *data      __attribute__((unused)),
 	cksum_xfer_free(xfer);
 }
 
-LOCAL void
+static void
 cksum_xfers_remove_all(void)
 {
 	struct t_hashtable *xfers = cksum_global_data->xfers;
@@ -168,8 +298,8 @@ cksum_xfers_remove_all(void)
 	weechat_hashtable_remove_all(xfers);
 }
 
-LOCAL inline int
-is_not_hex_char(char c)
+static inline int
+cksum_is_not_hex_char(char c)
 {
 	if ( (   c >= '0' && c <= '9' )
 	     || (c >= 'A' && c <= 'Z' )
@@ -179,8 +309,8 @@ is_not_hex_char(char c)
 		return 1;
 }
 
-LOCAL char*
-get_crc32(regex_t *re, const char *str)
+static char*
+cksum_get_crc32(regex_t *re, const char *str)
 {
 	if (!str || !re) return NULL;
 
@@ -190,15 +320,14 @@ get_crc32(regex_t *re, const char *str)
 	char        *ret         = NULL;
 
 	if (crc32_found != REG_NOMATCH) {
-		int   hoffset = is_not_hex_char(str[crc32_match.rm_so]);
-		ret           = weechat_strndup(str + crc32_match.rm_so + hoffset,
-		                                nbytes*2);
+		int   hoffset = cksum_is_not_hex_char(str[crc32_match.rm_so]);
+		ret           = strndup(str + crc32_match.rm_so + hoffset, nbytes*2);
 	}
 
 	return ret;
 }
 
-LOCAL cksum_ctx_t*
+static cksum_ctx_t*
 cksum_ctx_new (cksum_globals_t *globals, char* md5, const char* filename)
 {
 	cksum_ctx_t *ctx = malloc(sizeof(cksum_ctx_t));
@@ -207,7 +336,7 @@ cksum_ctx_new (cksum_globals_t *globals, char* md5, const char* filename)
 		ctx->globals    = globals;
 		ctx->md5        = (md5)? strdup (md5) : NULL;
 		ctx->filename   = strdup (filename);
-		ctx->crc32      = get_crc32 (globals->re_crc32, ctx->filename);
+		ctx->crc32      = cksum_get_crc32 (globals->re_crc32, ctx->filename);
 		ctx->ref_cnt    = 1;
 		ctx->size       = 0;
 		ctx->total_read = 0;
@@ -226,13 +355,13 @@ cksum_ctx_new (cksum_globals_t *globals, char* md5, const char* filename)
 	}
 }
 
-LOCAL void
+/*static void
 cksum_ctx_ref(cksum_ctx_t *ctx)
 {
 	++ctx->ref_cnt;
-}
+}*/
 
-LOCAL void
+static void
 cksum_ctx_unref(cksum_ctx_t *ctx)
 {
 	--ctx->ref_cnt;
@@ -250,8 +379,8 @@ cksum_ctx_unref(cksum_ctx_t *ctx)
 	}
 }
 
-LOCAL void
-print_regcomp_error(int code, const regex_t* preg, struct t_weechat_plugin *weechat_plugin)
+static void
+cksum_regcomp_perror(int code, const regex_t* preg, struct t_weechat_plugin *weechat_plugin)
 {
 	char* buf = NULL;
 	size_t len = 0;
@@ -266,15 +395,15 @@ print_regcomp_error(int code, const regex_t* preg, struct t_weechat_plugin *weec
 	}
 }
 
-LOCAL bool
+static bool
 cksum_global_init(void)
 {
 	cksum_global_data = malloc(sizeof(cksum_globals_t));
 	if (!cksum_global_data) return false;
-	cksum_global_data->xfers    = weechat_hashtable_new(128,
-	                                                    WEECHAT_HASHTABLE_STRING,
-	                                                    WEECHAT_HASHTABLE_POINTER,
-	                                                    NULL, NULL);
+	cksum_global_data->xfers           = weechat_hashtable_new(16,
+	                                                           WEECHAT_HASHTABLE_STRING,
+	                                                           WEECHAT_HASHTABLE_POINTER,
+	                                                           NULL, NULL);
 	cksum_global_data->hook_print      = NULL;
 	cksum_global_data->hook_xfer_ended = NULL;
 	cksum_global_data->re_tx_complete  = malloc(sizeof(regex_t));
@@ -285,6 +414,7 @@ cksum_global_init(void)
 	cksum_global_data->buf             = malloc(cksum_global_data->len);
 	cksum_global_data->elen            = 128;
 	cksum_global_data->ebuf            = malloc(cksum_global_data->elen);
+	cksum_global_data->strstr_ctx      = cksum_strstr_new("Transfer Completed", 18, 15, 16);
 
 	if ( cksum_global_data->xfers
 	     && cksum_global_data->re_tx_complete 
@@ -292,29 +422,30 @@ cksum_global_init(void)
 	     && cksum_global_data->re_nick 
 	     && cksum_global_data->re_crc32
 	     && cksum_global_data->ebuf
-	     && cksum_global_data->buf) {
+	     && cksum_global_data->buf
+	     && cksum_global_data->strstr_ctx ) {
 		int code = regcomp(cksum_global_data->re_tx_complete,
 		                   "Transfer Completed", REG_ICASE | REG_EXTENDED | REG_NOSUB);
 		if (code != 0) {
-			print_regcomp_error(code, cksum_global_data->re_tx_complete, weechat_plugin);
+			cksum_regcomp_perror(code, cksum_global_data->re_tx_complete, weechat_plugin);
 			goto malloc_err;
 		}
 		code = regcomp(cksum_global_data->re_md5,
 		               "[0-9A-F]{32}", REG_ICASE | REG_EXTENDED);
 		if (code != 0) {
-			print_regcomp_error(code, cksum_global_data->re_md5, weechat_plugin);
+			cksum_regcomp_perror(code, cksum_global_data->re_md5, weechat_plugin);
 			goto cksum_err;
 		}
 		code = regcomp(cksum_global_data->re_nick,
 		               "^[^ ]+", REG_EXTENDED);
 		if (code != 0) {
-			print_regcomp_error(code, cksum_global_data->re_nick, weechat_plugin);
+			cksum_regcomp_perror(code, cksum_global_data->re_nick, weechat_plugin);
 			goto rn_err;
 		}
 		code = regcomp(cksum_global_data->re_crc32,
 		               "([^0-9A-Z]|^)[0-9A-F]{8}([^0-9A-Z]|$)", REG_ICASE | REG_EXTENDED);
 		if (code != 0) {
-			print_regcomp_error(code, cksum_global_data->re_crc32, weechat_plugin);
+			cksum_regcomp_perror(code, cksum_global_data->re_crc32, weechat_plugin);
 			goto crc32_err;
 		}
 		
@@ -336,15 +467,16 @@ cksum_global_init(void)
 	if (cksum_global_data->re_md5)         free(cksum_global_data->re_md5);
 	if (cksum_global_data->re_nick)        free(cksum_global_data->re_nick);
 	if (cksum_global_data->re_crc32)       free(cksum_global_data->re_crc32);
-	if (cksum_global_data->ebuf)           free(cksum_global_data->ebuf);
 	if (cksum_global_data->buf)            free(cksum_global_data->buf);
+	if (cksum_global_data->ebuf)           free(cksum_global_data->ebuf);
+	if (cksum_global_data->strstr_ctx)  cksum_strstr_free(cksum_global_data->strstr_ctx);
 	free (cksum_global_data);
 	cksum_global_data = NULL;
 	return false;
 }
 
-LOCAL char*
-get_checksum(gcry_md_hd_t *gcry, int algo)
+static char*
+cksum_get_checksum(gcry_md_hd_t *gcry, int algo)
 {
 	unsigned int   nbytes   = gcry_md_get_algo_dlen(algo);
 	unsigned char *bin_hash = gcry_md_read(*gcry, algo);
@@ -360,8 +492,8 @@ get_checksum(gcry_md_hd_t *gcry, int algo)
 	return hash;
 }
 
-LOCAL bool
-compare_checksums(char *cksum, char *l, char *r)
+static bool
+cksum_compare_checksums(char *cksum, char *l, char *r)
 {
 	bool ret = false;
 	if (l && r && cksum) {
@@ -381,10 +513,10 @@ compare_checksums(char *cksum, char *l, char *r)
 	return ret;
 }
 
-LOCAL int
+static int
 cksum_fd_callback(void *cbdata, int fd)
 {
-	cksum_ctx_t     *ctx     = (cksum_ctx_t*) cbdata;
+	cksum_ctx_t   *ctx     = (cksum_ctx_t*) cbdata;
 	ssize_t        blen    = ctx->globals->len;
 	unsigned char *buf     = ctx->globals->buf;
 	size_t         elen    = ctx->globals->elen;
@@ -399,6 +531,7 @@ cksum_fd_callback(void *cbdata, int fd)
 		sread = read(fd, buf, blen);
 	else
 		sread = read(fd, buf, to_read);
+
 	if (sread < 0) {
 		if (errno == EINTR) return WEECHAT_RC_OK;
 		int merrno = errno;
@@ -417,16 +550,16 @@ cksum_fd_callback(void *cbdata, int fd)
 		/* Done reading */
 		if (ctx->total_read >= ctx->size) {
 			/* Compare md5sum */
-			char *hash = get_checksum (gcry, GCRY_MD_MD5);
+			char *hash = cksum_get_checksum (gcry, GCRY_MD_MD5);
 			if (hash) {
-				compare_checksums ("md5sum", hash, ctx->md5);
+				cksum_compare_checksums ("md5sum", hash, ctx->md5);
 				free (hash);
 			}
 
 			/* Compare crc32 */
-			hash = get_checksum (gcry, GCRY_MD_CRC32);
+			hash = cksum_get_checksum (gcry, GCRY_MD_CRC32);
 			if (hash) {
-				compare_checksums ("CRC32", hash, ctx->crc32);
+				cksum_compare_checksums ("CRC32", hash, ctx->crc32);
 				free (hash);
 			}
 
@@ -452,8 +585,8 @@ cksum_fd_callback(void *cbdata, int fd)
 	return ret;
 }
 
-LOCAL bool
-setup_self_hash(cksum_ctx_t *ctx)
+static bool
+cksum_setup_self_hash(cksum_ctx_t *ctx)
 {
 	struct stat  mstat;
 	char        *ebuf = ctx->globals->ebuf;
@@ -533,8 +666,8 @@ setup_self_hash(cksum_ctx_t *ctx)
 	return false;
 }
 
-LOCAL bool
-on_cksum_recv(const char* nick, char* md5, cksum_globals_t *globals)
+static bool
+cksum_on_md5_recv(const char* nick, char* md5, cksum_globals_t *globals)
 {
 	/* Get list of xfers */
 	struct t_infolist *infolist;
@@ -555,7 +688,7 @@ on_cksum_recv(const char* nick, char* md5, cksum_globals_t *globals)
 			const char* fn = weechat_infolist_string(infolist, "local_filename");
 			cksum_ctx_t *ctx = cksum_ctx_new(globals, md5, fn);
 			if (ctx) {
-				ret = setup_self_hash(ctx);
+				ret = cksum_setup_self_hash(ctx);
 
 				/* Prevent CRC32 timer from starting second hash */
 				cksum_xfer_t *xfer = cksum_xfers_find(fn);
@@ -563,7 +696,7 @@ on_cksum_recv(const char* nick, char* md5, cksum_globals_t *globals)
 					cksum_xfers_remove(xfer);
 				}
 			} else {
-				weechat_printf(NULL, "%s%sUnable to create context (on_cksum_recv)",
+				weechat_printf(NULL, "%s%sUnable to create context (cksum_on_md5_recv)",
 				               weechat_prefix("error"), CKSUM_PREFIX);
 			}
 
@@ -575,7 +708,7 @@ on_cksum_recv(const char* nick, char* md5, cksum_globals_t *globals)
 	return ret;
 }
 
-LOCAL int
+static int
 cksum_cb_process_message(void                 *cbdata,
                          struct t_gui_buffer  *buffer     __attribute__((unused)),
                          time_t                date       __attribute__((unused)),
@@ -589,8 +722,8 @@ cksum_cb_process_message(void                 *cbdata,
 	if (!globals) return WEECHAT_RC_ERROR;
 	if (!message) return WEECHAT_RC_OK;
 
-	/* Determine if this message is interesting */
-	if (regexec(globals->re_tx_complete, message, 1, NULL, 0) != REG_NOMATCH) {
+	/* Determine if this message is interesting (contains Transfer Completed) */
+	if (cksum_strstr(globals->strstr_ctx, message) != NULL) {
 		regmatch_t cksum_match;
 		regmatch_t nick_match;
 		int cksum_found  = regexec(globals->re_md5,  message, 1, &cksum_match, 0);
@@ -600,17 +733,16 @@ cksum_cb_process_message(void                 *cbdata,
 		if (cksum_found != REG_NOMATCH && nick_found != REG_NOMATCH) {
 			char* nick = NULL;
 			char* md5  = NULL;
-			nick = weechat_strndup(message + nick_match.rm_so,
-			                     nick_match.rm_eo - nick_match.rm_so);
-			md5 = weechat_strndup(message + cksum_match.rm_so,
-			                      32);
+			nick = strndup(message + nick_match.rm_so,
+			               nick_match.rm_eo - nick_match.rm_so);
+			md5 = strndup(message + cksum_match.rm_so, 32);
 			if (!md5 || !nick) {
 				if (nick) free (nick);
 				if (md5) free (md5);
 				return WEECHAT_RC_ERROR;
 			}
 
-			bool ret = on_cksum_recv(nick, md5, globals);
+			bool ret = cksum_on_md5_recv(nick, md5, globals);
 			free(md5);
 			free(nick);
 			if (!ret) return WEECHAT_RC_ERROR;
@@ -620,14 +752,14 @@ cksum_cb_process_message(void                 *cbdata,
 	return WEECHAT_RC_OK;
 }
 
-LOCAL int
+static int
 cksum_cb_timer(void* cbdata, int remaining_calls __attribute__((unused)) )
 {
 	cksum_globals_t *globals = cksum_global_data;
 	cksum_xfer_t    *xfer    = (cksum_xfer_t*)cbdata;
 	cksum_ctx_t     *ctx     = cksum_ctx_new(globals, NULL, xfer->filename);
 	if (ctx) {
-		setup_self_hash(ctx);
+		cksum_setup_self_hash(ctx);
 		cksum_xfers_remove(xfer);
 	} else {
 		weechat_printf(NULL, "%s%sUnable to create context (cb_timer)",
@@ -637,7 +769,7 @@ cksum_cb_timer(void* cbdata, int remaining_calls __attribute__((unused)) )
 	return WEECHAT_RC_OK;
 }
 
-LOCAL int
+static int
 cksum_cb_xfer_ended(void* cbdata,
                     const char *signal    __attribute__((unused)),
                     const char *type_data __attribute__((unused)),
@@ -645,7 +777,10 @@ cksum_cb_xfer_ended(void* cbdata,
 {
 	/* Weechat as of 4.0 does not give a complete infolist in this    *
 	 * signal. So we have to get the whole list of xfers and find the *
-	 * right one that has the information we need (local_filename).   */
+	 * right one that has the information we need (local_filename).   *
+	 * The most recent xfers seem to be the first returned from       *
+	 * weechat_infolist_next.                                         */
+
 	cksum_globals_t   *globals      = (cksum_globals_t*) cbdata;
 	struct t_infolist *sig_infolist = (struct t_infolist*) signal_data;
 	struct t_infolist *infolist     = weechat_infolist_get("xfer", NULL, NULL);
@@ -655,7 +790,7 @@ cksum_cb_xfer_ended(void* cbdata,
 	if (!weechat_infolist_next(sig_infolist)) return WEECHAT_RC_ERROR;
 
 	const char *sig_filename = weechat_infolist_string(sig_infolist, "filename");
-	char *crc32 = get_crc32(globals->re_crc32, sig_filename);
+	char *crc32 = cksum_get_crc32 (globals->re_crc32, sig_filename);
 	if (crc32) {
 		while (weechat_infolist_next(infolist)) {
 			const char *filename = weechat_infolist_string(infolist, "filename");
@@ -726,10 +861,10 @@ weechat_plugin_end (struct t_weechat_plugin *weechat_plugin)
 	cksum_globals_t *globals = cksum_global_data;
 
 	if (globals) {
-		cksum_xfers_remove_all();
+		cksum_xfers_remove_all ();
 		weechat_hashtable_free (cksum_global_data->xfers);
-		if (globals->hook_print) weechat_unhook(globals->hook_print);
-		if (globals->hook_xfer_ended) weechat_unhook(globals->hook_xfer_ended);
+		if (globals->hook_print) weechat_unhook (globals->hook_print);
+		if (globals->hook_xfer_ended) weechat_unhook (globals->hook_xfer_ended);
 		regfree (globals->re_crc32);
 		regfree (globals->re_nick);
 		regfree (globals->re_md5);
@@ -740,9 +875,15 @@ weechat_plugin_end (struct t_weechat_plugin *weechat_plugin)
 		free (globals->re_tx_complete);
 		free (globals->buf);
 		free (globals->ebuf);
+		cksum_strstr_free (globals->strstr_ctx);
 		free (globals);
 		cksum_global_data = NULL;
 	}
 
 	return WEECHAT_RC_OK;
 }
+
+#undef AVAILABLE
+#undef CMP_FUNC
+#undef CANON_ELEMENT
+#undef EXTERN
