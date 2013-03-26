@@ -492,25 +492,49 @@ cksum_get_checksum(gcry_md_hd_t *gcry, int algo)
 	return hash;
 }
 
-static bool
-cksum_compare_checksums(char *cksum, char *l, char *r)
+static char*
+cksum_compare_checksums(char *cksum, char *l, char *r, bool *mismatch)
 {
-	bool ret = false;
+	char* rc = NULL;
+	int n;
+
 	if (l && r && cksum) {
 		if (weechat_strcasecmp(l, r) == 0) {
-			weechat_printf(NULL, "%s%s%s verified%s: %s",
-			               CKSUM_PREFIX, weechat_color("green"),
-			               cksum, weechat_color("chat"), l);
-			ret = true;
+			*mismatch = *mismatch || false;
+			n = snprintf(NULL, 0, "%s%s verified%s: %s",
+			             weechat_color("green"),
+			             cksum, weechat_color("chat"), l);
+			if (n > -1) {
+				if ( (rc = malloc(n + 1)) == NULL )
+					return NULL;
+				n = snprintf(rc, n+1, "%s%s verified%s: %s",
+				             weechat_color("green"),
+				             cksum, weechat_color("chat"), l);
+				if (n == -1) {
+					free (rc);
+					rc = NULL;
+				}
+			}
 		} else {
-			weechat_printf(NULL, "%s%s%s%s checksum mismatch!%s %s != %s", 
-			               weechat_prefix("error"), CKSUM_PREFIX,
-			               weechat_color("red"), cksum,
-			               weechat_color("chat"), l, r);
+			*mismatch = true;
+			n = snprintf(NULL, 0, "%s%s checksum mismatch!%s %s != %s", 
+			             weechat_color("red"), cksum,
+			             weechat_color("chat"), l, r);
+			if (n > -1) {
+				if ( (rc = malloc(n + 1)) == NULL)
+					return NULL;
+				n = snprintf(rc, n+1, "%s%s checksum mismatch!%s %s != %s", 
+				             weechat_color("red"), cksum,
+				             weechat_color("chat"), l, r);
+				if (n == -1) {
+					free (rc);
+					rc = NULL;
+				}
+			}
 		}
 	}
 
-	return ret;
+	return rc;
 }
 
 static int
@@ -551,16 +575,41 @@ cksum_fd_callback(void *cbdata, int fd)
 		if (ctx->total_read >= ctx->size) {
 			/* Compare md5sum */
 			char *hash = cksum_get_checksum (gcry, GCRY_MD_MD5);
+			char *md5_out = NULL;
+			char *crc32_out = NULL;
+			bool mismatch = false;
 			if (hash) {
-				cksum_compare_checksums ("md5sum", hash, ctx->md5);
+				md5_out = cksum_compare_checksums ("md5sum", hash, ctx->md5, &mismatch);
 				free (hash);
 			}
 
 			/* Compare crc32 */
 			hash = cksum_get_checksum (gcry, GCRY_MD_CRC32);
 			if (hash) {
-				cksum_compare_checksums ("CRC32", hash, ctx->crc32);
+				crc32_out = cksum_compare_checksums ("CRC32", hash, ctx->crc32, &mismatch);
 				free (hash);
+			}
+
+			if (md5_out && crc32_out) {
+				if (mismatch)
+					weechat_printf(NULL, "%s%s%s, %s", weechat_prefix("error"),
+					               CKSUM_PREFIX, md5_out, crc32_out);
+				else
+					weechat_printf(NULL, "%s%s, %s", CKSUM_PREFIX, md5_out, crc32_out);
+				free (md5_out);
+				free (crc32_out);
+			} else if (md5_out) {
+				if (mismatch)
+					weechat_printf(NULL, "%s%s%s", weechat_prefix("error"), CKSUM_PREFIX, md5_out);
+				else
+					weechat_printf(NULL, "%s%s", CKSUM_PREFIX, md5_out);
+				free (md5_out);
+			} else if (crc32_out) {
+				if (mismatch)
+					weechat_printf(NULL, "%s%s%s", weechat_prefix("error"), CKSUM_PREFIX, crc32_out);
+				else
+					weechat_printf(NULL, "%s%s", CKSUM_PREFIX, crc32_out);
+				free (crc32_out);
 			}
 
 			/* Done reading, unhook and close fd */
