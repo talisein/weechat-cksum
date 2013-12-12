@@ -649,14 +649,8 @@ cksum_fd_callback(void *cbdata, int fd)
 	weechat_unhook(ctx->hook_fd);
 	ctx->hook_fd = NULL;
 	cksum_ctx_unref(ctx);
-	while (close(fd) < 0) {
-		if (errno == EINTR) continue;
-		int merrno = errno;
-		weechat_printf(NULL, "%s%sFailed to close fd: %s",
-		               weechat_prefix("error"), CKSUM_PREFIX,
-		               strerror_r(merrno, ebuf, elen));
-		ret = WEECHAT_RC_ERROR;
-	}
+    close(fd);
+
 	return ret;
 }
 
@@ -728,15 +722,7 @@ cksum_setup_self_hash(cksum_ctx_t *ctx)
 	free(ctx->gcry);
 	ctx->gcry = NULL;
  err:
-	while (close(fd) == -1) {
-		if (errno == EINTR) continue;
-		int merrno = errno;
-		weechat_printf(NULL, "%s%sFailed to close fd: %s", 
-		               weechat_prefix("error"), CKSUM_PREFIX,
-		               strerror_r(merrno, ebuf, elen));
-		break;
-	}
-
+    close(fd);
 	cksum_ctx_unref(ctx);
 	return false;
 }
