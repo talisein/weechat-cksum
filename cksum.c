@@ -47,6 +47,10 @@ EXTERN const char weechat_plugin_description[] = "Performs checksum validation a
 EXTERN const char weechat_plugin_version[]     = "0.10.1";
 EXTERN const char weechat_plugin_license[]     = "GPL3";
 
+/** Structure to hold substring match lookup table.
+ *
+ * Implementation mostly taken from glibc.
+ */
 typedef struct {
 	size_t *shift_table;
 	const char *needle;
@@ -75,6 +79,7 @@ typedef struct {
 	char            *md5;
 	char            *crc32;
 	char            *filename;
+	char            *fn;
 	off_t            size;
 	ssize_t          total_read;
 	unsigned int     ref_cnt;
@@ -83,8 +88,9 @@ typedef struct {
 } cksum_ctx_t;
 
 typedef struct {
-	char *filename;
+	char *local_filename;
 	char *crc32;
+	char *filename;
 	struct t_hook *timer;
 } cksum_xfer_t;
 
@@ -203,16 +209,18 @@ cksum_strstr(const cksum_strstr_ctx_t *ctx, const char *haystack_start)
 }
 
 static cksum_xfer_t*
-cksum_xfer_new(const char* filename, const char* crc32)
+cksum_xfer_new(const char* local_filename, const char* crc32, const char* filename)
 {
-	cksum_xfer_t *xfer = (cksum_xfer_t*) malloc(sizeof(cksum_xfer_t));
+	cksum_xfer_t *xfer = (cksum_xfer_t*) calloc(1, sizeof(cksum_xfer_t));
 	if (xfer) {
-		xfer->filename = strdup (filename);
-		xfer->crc32    = strdup (crc32);
-		xfer->timer    = NULL;
-		if (!xfer->filename || !xfer->crc32) {
-			if (xfer->filename) free (xfer->filename);
-			if (xfer->crc32)    free (xfer->crc32);
+		xfer->local_filename = strdup (local_filename);
+		xfer->crc32          = strdup (crc32);
+		xfer->filename       = strdup (filename);
+		xfer->timer          = NULL;
+		if (!xfer->local_filename || !xfer->crc32 || !xfer->filename) {
+			if (xfer->local_filename) free (xfer->local_filename);
+			if (xfer->crc32)          free (xfer->crc32);
+			if (xfer->filename)       free (xfer->filename);
 			free (xfer);
 			xfer = NULL;
 		}
@@ -225,8 +233,9 @@ static void
 cksum_xfer_free(cksum_xfer_t *xfer)
 {
 	if (xfer) {
-		if (xfer->filename) free (xfer->filename);
-		if (xfer->crc32)    free (xfer->crc32);
+		if (xfer->local_filename) free (xfer->local_filename);
+		if (xfer->crc32)          free (xfer->crc32);
+		if (xfer->filename)       free (xfer->filename);
 		if (xfer->timer) {
 			weechat_unhook(xfer->timer);
 			xfer->timer = NULL;
@@ -240,7 +249,7 @@ cksum_xfers_add(cksum_xfer_t *xfer)
 {
 	if (xfer) {
 		struct t_hashtable *xfers = cksum_global_data->xfers;
-		char *key = strdup (xfer->filename);
+		char *key = strdup (xfer->local_filename);
 		if (key)
 			weechat_hashtable_set(xfers, key, xfer);
 	}
@@ -251,7 +260,7 @@ cksum_xfers_remove(cksum_xfer_t *xfer)
 {
 	if (xfer) {
 		struct t_hashtable *xfers = cksum_global_data->xfers;
-		weechat_hashtable_remove(xfers, (void*) xfer->filename);
+		weechat_hashtable_remove(xfers, (void*) xfer->local_filename);
 		cksum_xfer_free(xfer);
 	}
 }
@@ -320,32 +329,34 @@ cksum_get_crc32(regex_t *re, const char *str)
 	char        *ret         = NULL;
 
 	if (crc32_found != REG_NOMATCH) {
-		int   hoffset = cksum_is_not_hex_char(str[crc32_match.rm_so]);
-		ret           = strndup(str + crc32_match.rm_so + hoffset, nbytes*2);
+		int hoffset = cksum_is_not_hex_char(str[crc32_match.rm_so]);
+		ret         = strndup(str + crc32_match.rm_so + hoffset, nbytes*2);
 	}
 
 	return ret;
 }
 
 static cksum_ctx_t*
-cksum_ctx_new (cksum_globals_t *globals, char* md5, const char* filename)
+cksum_ctx_new (cksum_globals_t *globals, char* md5, const char* local_filename, const char* filename)
 {
-	cksum_ctx_t *ctx = malloc(sizeof(cksum_ctx_t));
+	cksum_ctx_t *ctx = calloc(1, sizeof(cksum_ctx_t));
 
 	if (ctx) {
 		ctx->globals    = globals;
 		ctx->md5        = (md5)? strdup (md5) : NULL;
-		ctx->filename   = strdup (filename);
+		ctx->filename   = strdup (local_filename);
+		ctx->fn         = strdup (filename);
 		ctx->crc32      = cksum_get_crc32 (globals->re_crc32, ctx->filename);
 		ctx->ref_cnt    = 1;
 		ctx->size       = 0;
 		ctx->total_read = 0;
 		ctx->hook_fd    = NULL;
 		ctx->gcry       = NULL;
-		if ( (md5 && !ctx->md5) || !ctx->filename) {
+		if ( (md5 && !ctx->md5) || !ctx->filename || !ctx->fn) {
 			if (ctx->md5)      free (ctx->md5);
-			if (ctx->crc32)    free (ctx->md5);
-			if (ctx->filename) free (ctx->md5);
+			if (ctx->fn)       free (ctx->fn);
+			if (ctx->crc32)    free (ctx->crc32);
+			if (ctx->filename) free (ctx->filename);
 			free (ctx);
 			return NULL;
 		}
@@ -373,6 +384,7 @@ cksum_ctx_unref(cksum_ctx_t *ctx)
 		}
 
 		if (ctx->filename) free (ctx->filename);
+		if (ctx->fn)       free (ctx->fn);
 		if (ctx->md5)      free (ctx->md5);
 		if (ctx->crc32)    free (ctx->crc32);
 		free(ctx);
@@ -592,23 +604,37 @@ cksum_fd_callback(void *cbdata, int fd)
 
 			if (md5_out && crc32_out) {
 				if (mismatch)
-					weechat_printf(NULL, "%s%s%s, %s", weechat_prefix("error"),
-					               CKSUM_PREFIX, md5_out, crc32_out);
+					weechat_printf(NULL, "%s%sFile %s: %s, %s",
+					               weechat_prefix("error"),
+					               CKSUM_PREFIX,
+					               ctx->fn, md5_out, crc32_out);
 				else
-					weechat_printf(NULL, "%s%s, %s", CKSUM_PREFIX, md5_out, crc32_out);
+					weechat_printf(NULL, "%sFile %s: %s, %s",
+					               CKSUM_PREFIX,
+					               ctx->fn, md5_out, crc32_out);
 				free (md5_out);
 				free (crc32_out);
 			} else if (md5_out) {
 				if (mismatch)
-					weechat_printf(NULL, "%s%s%s", weechat_prefix("error"), CKSUM_PREFIX, md5_out);
+					weechat_printf(NULL, "%s%sFile %s: %s",
+					               weechat_prefix("error"),
+					               CKSUM_PREFIX,
+					               ctx->fn, md5_out);
 				else
-					weechat_printf(NULL, "%s%s", CKSUM_PREFIX, md5_out);
+					weechat_printf(NULL, "%sFile %s: %s",
+					               CKSUM_PREFIX,
+					               ctx->fn, md5_out);
 				free (md5_out);
 			} else if (crc32_out) {
 				if (mismatch)
-					weechat_printf(NULL, "%s%s%s", weechat_prefix("error"), CKSUM_PREFIX, crc32_out);
+					weechat_printf(NULL, "%s%sFile %s: %s",
+					               weechat_prefix("error"),
+					               CKSUM_PREFIX,
+					               ctx->fn, crc32_out);
 				else
-					weechat_printf(NULL, "%s%s", CKSUM_PREFIX, crc32_out);
+					weechat_printf(NULL, "%sFile %s: %s",
+					               CKSUM_PREFIX,
+					               ctx->fn, crc32_out);
 				free (crc32_out);
 			}
 
@@ -734,8 +760,9 @@ cksum_on_md5_recv(const char* nick, char* md5, cksum_globals_t *globals)
 		const int status = weechat_infolist_integer(infolist, "status");
 		if ( status == XFER_STATUS_DONE && strcmp(remote_nick, nick) == 0) {
 			/* Create cksum_ctx and start hashing */
-			const char* fn = weechat_infolist_string(infolist, "local_filename");
-			cksum_ctx_t *ctx = cksum_ctx_new(globals, md5, fn);
+			const char* lfn = weechat_infolist_string(infolist, "local_filename");
+			const char* fn = weechat_infolist_string(infolist, "filename");
+			cksum_ctx_t *ctx = cksum_ctx_new(globals, md5, lfn, fn);
 			if (ctx) {
 				ret = cksum_setup_self_hash(ctx);
 
@@ -806,7 +833,9 @@ cksum_cb_timer(void* cbdata, int remaining_calls __attribute__((unused)) )
 {
 	cksum_globals_t *globals = cksum_global_data;
 	cksum_xfer_t    *xfer    = (cksum_xfer_t*)cbdata;
-	cksum_ctx_t     *ctx     = cksum_ctx_new(globals, NULL, xfer->filename);
+	cksum_ctx_t     *ctx     = cksum_ctx_new(globals, NULL,
+	                                         xfer->local_filename,
+	                                         xfer->filename);
 	if (ctx) {
 		cksum_setup_self_hash(ctx);
 		cksum_xfers_remove(xfer);
@@ -838,17 +867,17 @@ cksum_cb_xfer_ended(void* cbdata,
 	if (!sig_infolist)                        return WEECHAT_RC_ERROR;
 	if (!weechat_infolist_next(sig_infolist)) return WEECHAT_RC_ERROR;
 
-	const char *sig_filename = weechat_infolist_string(sig_infolist, "filename");
-	char *crc32 = cksum_get_crc32 (globals->re_crc32, sig_filename);
+	const char *fn = weechat_infolist_string(sig_infolist, "filename");
+	char *crc32 = cksum_get_crc32 (globals->re_crc32, fn);
 	if (crc32) {
 		while (weechat_infolist_next(infolist)) {
 			const char *filename = weechat_infolist_string(infolist, "filename");
 			int status = weechat_infolist_integer(infolist, "status");
-			if (status == XFER_STATUS_DONE && strcmp(filename, sig_filename) == 0) {
+			if (status == XFER_STATUS_DONE && strcmp(filename, fn) == 0) {
 				/* Match found, create new cksum_xfer and hash in 5 seconds */
-				const char *fn = weechat_infolist_string(infolist, "local_filename");
-				if (fn) {
-					cksum_xfer_t *xfer = cksum_xfer_new(fn, crc32);
+				const char *lfn = weechat_infolist_string(infolist, "local_filename");
+				if (lfn) {
+					cksum_xfer_t *xfer = cksum_xfer_new(lfn, crc32, fn);
 					if (xfer) {
 						struct t_hook *hook = weechat_hook_timer(5000, 0, 1,
 						                                         &cksum_cb_timer,
