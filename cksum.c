@@ -564,12 +564,11 @@ cksum_fd_callback(void *cbdata, int fd)
 
 	/* Read from fd */
 	if (to_read >= blen)
-		sread = read(fd, buf, blen);
+		sread = TEMP_FAILURE_RETRY(read(fd, buf, blen));
 	else
-		sread = read(fd, buf, to_read);
+		sread = TEMP_FAILURE_RETRY(read(fd, buf, to_read));
 
 	if (sread < 0) {
-		if (errno == EINTR) return WEECHAT_RC_OK;
 		int merrno = errno;
 		weechat_printf(NULL, "%s%sError reading file: %s",
 		               weechat_prefix("error"), CKSUM_PREFIX,
@@ -663,18 +662,15 @@ cksum_setup_self_hash(cksum_ctx_t *ctx)
 	int          fd   = -1;
 
 	/* Open fd */
-	while (fd == -1) {
-		fd = open(ctx->filename, O_RDONLY);
-		if (fd == -1) {
-			if (errno == EINTR) continue;
-			int merrno = errno;
-			weechat_printf(NULL, "%s%sError opening file '%s': %s",
-			               weechat_prefix("error"), CKSUM_PREFIX,
-			               ctx->filename,
-			               strerror_r(merrno, ebuf, elen));
-			return false;
-		}
-	}
+    fd = TEMP_FAILURE_RETRY(open(ctx->filename, O_RDONLY));
+    if (fd == -1) {
+        int merrno = errno;
+        weechat_printf(NULL, "%s%sError opening file '%s': %s",
+                       weechat_prefix("error"), CKSUM_PREFIX,
+                       ctx->filename,
+                       strerror_r(merrno, ebuf, elen));
+        return false;
+    }
 
 	/* Get file size */
 	int sret = fstat(fd, &mstat);
