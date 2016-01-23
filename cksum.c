@@ -44,7 +44,7 @@ EXTERN const char weechat_plugin_name[]        = "cksum";
 EXTERN const char weechat_plugin_api_version[] = WEECHAT_PLUGIN_API_VERSION;
 EXTERN const char weechat_plugin_author[]      = "talisein";
 EXTERN const char weechat_plugin_description[] = "Performs checksum validation after DCC file xfer";
-EXTERN const char weechat_plugin_version[]     = "0.10.1";
+EXTERN const char weechat_plugin_version[]     = "0.11.0";
 EXTERN const char weechat_plugin_license[]     = "GPL3";
 
 /** Structure to hold substring match lookup table.
@@ -224,7 +224,10 @@ cksum_xfer_new(const char* local_filename, const char* crc32, const char* filena
 			free (xfer);
 			xfer = NULL;
 		}
-	}
+	} else {
+        weechat_printf(NULL, "%s%sUnable to allocate memory",
+                       weechat_prefix("error"), CKSUM_PREFIX);
+    }
 
 	return xfer;
 }
@@ -570,6 +573,7 @@ cksum_fd_callback(void *cbdata, int fd)
 
 	if (sread < 0) {
 		int merrno = errno;
+        if (merrno == EAGAIN || merrno == EWOULDBLOCK) return WEECHAT_RC_OK;
 		weechat_printf(NULL, "%s%sError reading file: %s",
 		               weechat_prefix("error"), CKSUM_PREFIX,
 		               strerror_r(merrno, ebuf, elen));
@@ -581,6 +585,17 @@ cksum_fd_callback(void *cbdata, int fd)
 	if (sread > 0) {
 		gcry_md_write(*gcry, buf, sread);
 		ctx->total_read += sread;
+
+        if (to_read >= blen && sread != blen) {
+            weechat_printf(NULL, "%s%sActually had a short read. Read %zd wanted %zd",
+                           weechat_prefix("error"), CKSUM_PREFIX,
+                           sread, blen);
+        }
+        if (to_read < blen && sread != to_read) {
+            weechat_printf(NULL, "%s%sActually had a short read. Read %zd wanted %zd",
+                           weechat_prefix("error"), CKSUM_PREFIX,
+                           sread, to_read);
+        }
 
 		/* Done reading */
 		if (ctx->total_read >= ctx->size) {
@@ -672,6 +687,15 @@ cksum_setup_self_hash(cksum_ctx_t *ctx)
         return false;
     }
 
+    /* Set nonblocking. This probably does very little good. */
+    if ( -1 == fcntl(fd, F_SETFL, O_NONBLOCK) ) {
+        int merrno = errno;
+		weechat_printf(NULL, "%s%sError setting nonblocking mode on %s: %s",
+		               weechat_prefix("error"), CKSUM_PREFIX,
+		               ctx->filename,
+		               strerror_r(merrno, ebuf, elen));
+    }
+
 	/* Get file size */
 	int sret = fstat(fd, &mstat);
 	if (sret == -1) {
@@ -704,6 +728,11 @@ cksum_setup_self_hash(cksum_ctx_t *ctx)
 	}
 
 	/* Hook fd */
+    /* While select() on a local file fd probably always returns
+     * immediately, a side effect of reading the fd this way is
+     * returning back to the weechat main loop after processing a bit
+     * of the file. The intent is to not ever perceivably block the
+     * weechat UI; a better approach would be a full-blown fork(). */
 	struct t_hook *hook = weechat_hook_fd(fd, 1, 0, 0, &cksum_fd_callback, ctx);
 	ctx->hook_fd = hook;
 	if (hook == NULL) {
@@ -742,17 +771,23 @@ cksum_on_md5_recv(const char* nick, char* md5, cksum_globals_t *globals)
 		const int status = weechat_infolist_integer(infolist, "status");
 		if ( status == XFER_STATUS_DONE && strcmp(remote_nick, nick) == 0) {
 			/* Create cksum_ctx and start hashing */
-			const char* lfn = weechat_infolist_string(infolist, "local_filename");
-			const char* fn = weechat_infolist_string(infolist, "filename");
+			const char* lfn  = weechat_infolist_string(infolist, "local_filename");
+			const char* fn   = weechat_infolist_string(infolist, "filename");
 			cksum_ctx_t *ctx = cksum_ctx_new(globals, md5, lfn, fn);
 			if (ctx) {
 				ret = cksum_setup_self_hash(ctx);
 
 				/* Prevent CRC32 timer from starting second hash */
-				cksum_xfer_t *xfer = cksum_xfers_find(fn);
+				cksum_xfer_t *xfer = cksum_xfers_find(lfn);
 				if (xfer) {
 					cksum_xfers_remove(xfer);
-				}
+				} else {
+                    /* If theres no xfer in the table, xfer_ended
+                     * event not yet received.  Let's add the xfer
+                     * now, and remove it on xfer_ended.
+                     */
+                    cksum_xfers_add(xfer);
+                }
 			} else {
 				weechat_printf(NULL, "%s%sUnable to create context (cksum_on_md5_recv)",
 				               weechat_prefix("error"), CKSUM_PREFIX);
@@ -859,7 +894,15 @@ cksum_cb_xfer_ended(void* cbdata,
 				/* Match found, create new cksum_xfer and hash in 5 seconds */
 				const char *lfn = weechat_infolist_string(infolist, "local_filename");
 				if (lfn) {
-					cksum_xfer_t *xfer = cksum_xfer_new(lfn, crc32, fn);
+					cksum_xfer_t *xfer = cksum_xfers_find(lfn);
+                    if (xfer) {
+                        /* The md5 was received already, so lets not do anything. */
+                        cksum_xfers_remove(xfer);
+                        break;
+                    }
+
+                    /* Ok, md5 not received yet. Let's wait for one */
+					xfer = cksum_xfer_new(lfn, crc32, fn);
 					if (xfer) {
 						struct t_hook *hook = weechat_hook_timer(5000, 0, 1,
 						                                         &cksum_cb_timer,
@@ -868,6 +911,8 @@ cksum_cb_xfer_ended(void* cbdata,
 							xfer->timer = hook;
 							cksum_xfers_add(xfer);
 						} else {
+                            weechat_printf(NULL, "%s%sUnable to setup timer to check crc32",
+                                           weechat_prefix("error"), CKSUM_PREFIX);
 							cksum_xfer_free(xfer);
 						}
 					}
