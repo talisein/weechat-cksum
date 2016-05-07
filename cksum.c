@@ -37,14 +37,12 @@
 #define AVAILABLE(h, h_l, j, n_l)                       \
     (!memchr ((h) + (h_l), '\0', (j) + (n_l) - (h_l))   \
      && ((h_l) = (j) + (n_l)))
-#define CMP_FUNC(p1, p2, l)                                 \
-    strncmp ((const char *) (p1), (const char *) (p2), l)
 
 EXTERN const char weechat_plugin_name[]        = "cksum";
 EXTERN const char weechat_plugin_api_version[] = WEECHAT_PLUGIN_API_VERSION;
 EXTERN const char weechat_plugin_author[]      = "talisein";
 EXTERN const char weechat_plugin_description[] = "Performs checksum validation after DCC file xfer";
-EXTERN const char weechat_plugin_version[]     = "0.11.0";
+EXTERN const char weechat_plugin_version[]     = "0.11.1";
 EXTERN const char weechat_plugin_license[]     = "GPL3";
 
 /** Structure to hold substring match lookup table.
@@ -553,9 +551,11 @@ cksum_compare_checksums(char *cksum, char *l, char *r, bool *mismatch)
 }
 
 static int
-cksum_fd_callback(void *cbdata, int fd)
+cksum_fd_callback(const void *cbpointer,
+                  void *cbdata __attribute__((unused)),
+                  int fd)
 {
-    cksum_ctx_t   *ctx     = (cksum_ctx_t*) cbdata;
+    cksum_ctx_t   *ctx     = (cksum_ctx_t*) cbpointer;
     ssize_t        blen    = ctx->globals->len;
     unsigned char *buf     = ctx->globals->buf;
     size_t         elen    = ctx->globals->elen;
@@ -733,7 +733,7 @@ cksum_setup_self_hash(cksum_ctx_t *ctx)
      * returning back to the weechat main loop after processing a bit
      * of the file. The intent is to not ever perceivably block the
      * weechat UI; a better approach would be a full-blown fork(). */
-    struct t_hook *hook = weechat_hook_fd(fd, 1, 0, 0, &cksum_fd_callback, ctx);
+    struct t_hook *hook = weechat_hook_fd(fd, 1, 0, 0, &cksum_fd_callback, ctx, NULL);
     ctx->hook_fd = hook;
     if (hook == NULL) {
         weechat_printf(NULL, "%s%sError hooking fd",
@@ -782,11 +782,15 @@ cksum_on_md5_recv(const char* nick, char* md5, cksum_globals_t *globals)
                 if (xfer) {
                     cksum_xfers_remove(xfer);
                 } else {
-                    /* If theres no xfer in the table, xfer_ended
-                     * event not yet received.  Let's add the xfer
-                     * now, and remove it on xfer_ended.
-                     */
-                    cksum_xfers_add(xfer);
+                    char *crc32 = cksum_get_crc32 (globals->re_crc32, fn);
+                    if (crc32) {
+                        /* If theres no xfer in the table, xfer_ended
+                         * event not yet received.  Let's add the xfer
+                         * now, and remove it on xfer_ended.
+                         */
+                        xfer = cksum_xfer_new(lfn, crc32, fn);
+                        cksum_xfers_add(xfer);
+                    }
                 }
             } else {
                 weechat_printf(NULL, "%s%sUnable to create context (cksum_on_md5_recv)",
@@ -802,7 +806,8 @@ cksum_on_md5_recv(const char* nick, char* md5, cksum_globals_t *globals)
 }
 
 static int
-cksum_cb_process_message(void                 *cbdata,
+cksum_cb_process_message(const void           *cbpointer  __attribute__((unused)),
+                         void                 *cbdata     __attribute__((unused)),
                          struct t_gui_buffer  *buffer     __attribute__((unused)),
                          time_t                date       __attribute__((unused)),
                          int                   tags_count __attribute__((unused)),
@@ -811,7 +816,7 @@ cksum_cb_process_message(void                 *cbdata,
                          int                   highlight  __attribute__((unused)),
                          const char           *prefix     __attribute__((unused)),
                          const char           *message) {
-    cksum_globals_t *globals = (cksum_globals_t*) cbdata;
+    cksum_globals_t *globals = cksum_global_data;
     if (!globals) return WEECHAT_RC_ERROR;
     if (!message) return WEECHAT_RC_OK;
 
@@ -846,10 +851,12 @@ cksum_cb_process_message(void                 *cbdata,
 }
 
 static int
-cksum_cb_timer(void* cbdata, int remaining_calls __attribute__((unused)) )
+cksum_cb_timer(const void* cbpointer __attribute__((unused)),
+               void* cbdata          __attribute__((unused)),
+               int remaining_calls   __attribute__((unused)) )
 {
     cksum_globals_t *globals = cksum_global_data;
-    cksum_xfer_t    *xfer    = (cksum_xfer_t*)cbdata;
+    cksum_xfer_t    *xfer    = (cksum_xfer_t*)cbpointer;
     cksum_ctx_t     *ctx     = cksum_ctx_new(globals, NULL,
                                              xfer->local_filename,
                                              xfer->filename);
@@ -865,7 +872,8 @@ cksum_cb_timer(void* cbdata, int remaining_calls __attribute__((unused)) )
 }
 
 static int
-cksum_cb_xfer_ended(void* cbdata,
+cksum_cb_xfer_ended(const void *cbpointer __attribute__((unused)),
+                    void* cbdata          __attribute__((unused)),
                     const char *signal    __attribute__((unused)),
                     const char *type_data __attribute__((unused)),
                     void *signal_data)
@@ -876,7 +884,7 @@ cksum_cb_xfer_ended(void* cbdata,
      * The most recent xfers seem to be the first returned from       *
      * weechat_infolist_next.                                         */
 
-    cksum_globals_t   *globals      = (cksum_globals_t*) cbdata;
+    cksum_globals_t   *globals      = cksum_global_data;
     struct t_infolist *sig_infolist = (struct t_infolist*) signal_data;
     struct t_infolist *infolist     = weechat_infolist_get("xfer", NULL, NULL);
 
@@ -906,7 +914,7 @@ cksum_cb_xfer_ended(void* cbdata,
                     if (xfer) {
                         struct t_hook *hook = weechat_hook_timer(5000, 0, 1,
                                                                  &cksum_cb_timer,
-                                                                 xfer);
+                                                                 xfer, NULL);
                         if (hook) {
                             xfer->timer = hook;
                             cksum_xfers_add(xfer);
@@ -940,11 +948,11 @@ weechat_plugin_init (struct t_weechat_plugin *plugin,
     cksum_globals_t *globals    = cksum_global_data;
     struct t_hook   *print_hook = weechat_hook_print(NULL, NULL, NULL,
                                                      1, &cksum_cb_process_message,
-                                                     globals);
+                                                     NULL, NULL);
     if (print_hook == NULL) goto err;
     struct t_hook   *xfer_hook  = weechat_hook_signal("xfer_ended",
                                                       &cksum_cb_xfer_ended,
-                                                      globals);
+                                                      NULL, NULL);
     if (xfer_hook == NULL) {
         weechat_unhook(print_hook);
         goto err;
@@ -989,6 +997,5 @@ weechat_plugin_end (struct t_weechat_plugin *weechat_plugin)
 }
 
 #undef AVAILABLE
-#undef CMP_FUNC
 #undef CANON_ELEMENT
 #undef EXTERN
