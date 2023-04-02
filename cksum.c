@@ -76,8 +76,8 @@ typedef struct {
     cksum_globals_t *globals;
     char            *md5;
     char            *crc32;
-    char            *filename;
-    char            *fn;
+    char            *filename; /* local_filename */
+    char            *fn; /* original filename */
     off_t            size;
     ssize_t          total_read;
     unsigned int     ref_cnt;
@@ -861,6 +861,8 @@ cksum_cb_timer(const void* cbpointer __attribute__((unused)),
                                              xfer->local_filename,
                                              xfer->filename);
     if (ctx) {
+        weechat_printf(NULL, "%sNo md5 received for %s. Reporting CRC32...",
+                       CKSUM_PREFIX, xfer->local_filename);
         cksum_setup_self_hash(ctx);
         cksum_xfers_remove(xfer);
     } else {
@@ -886,53 +888,45 @@ cksum_cb_xfer_ended(const void *cbpointer __attribute__((unused)),
 
     cksum_globals_t   *globals      = cksum_global_data;
     struct t_infolist *sig_infolist = (struct t_infolist*) signal_data;
-    struct t_infolist *infolist     = weechat_infolist_get("xfer", NULL, NULL);
 
-    if (!infolist)                            return WEECHAT_RC_ERROR;
     if (!sig_infolist)                        return WEECHAT_RC_ERROR;
     if (!weechat_infolist_next(sig_infolist)) return WEECHAT_RC_ERROR;
 
-    const char *fn = weechat_infolist_string(sig_infolist, "filename");
-    char *crc32 = cksum_get_crc32 (globals->re_crc32, fn);
-    if (crc32) {
-        while (weechat_infolist_next(infolist)) {
-            const char *filename = weechat_infolist_string(infolist, "filename");
-            int status = weechat_infolist_integer(infolist, "status");
-            if (status == XFER_STATUS_DONE && strcmp(filename, fn) == 0) {
-                /* Match found, create new cksum_xfer and hash in 5 seconds */
-                const char *lfn = weechat_infolist_string(infolist, "local_filename");
-                if (lfn) {
-                    cksum_xfer_t *xfer = cksum_xfers_find(lfn);
-                    if (xfer) {
-                        /* The md5 was received already, so lets not do anything. */
-                        cksum_xfers_remove(xfer);
-                        break;
-                    }
-
-                    /* Ok, md5 not received yet. Let's wait for one */
-                    xfer = cksum_xfer_new(lfn, crc32, fn);
-                    if (xfer) {
-                        struct t_hook *hook = weechat_hook_timer(5000, 0, 1,
-                                                                 &cksum_cb_timer,
-                                                                 xfer, NULL);
-                        if (hook) {
-                            xfer->timer = hook;
-                            cksum_xfers_add(xfer);
-                        } else {
-                            weechat_printf(NULL, "%s%sUnable to setup timer to check crc32",
-                                           weechat_prefix("error"), CKSUM_PREFIX);
-                            cksum_xfer_free(xfer);
-                        }
-                    }
-                }
-                break;
-            }
-        }
-
-        free (crc32);
+    const char* fn  = weechat_infolist_string(sig_infolist, "filename");
+    const char *lfn = weechat_infolist_string(sig_infolist, "local_filename");
+    if (!lfn || *lfn == '\0' || !fn || *fn == '\0') {
+        weechat_printf(NULL, "%s%sxfer ended but local filename is empty (lfn: %s, fn: %s)",
+                       weechat_prefix("error"), CKSUM_PREFIX, lfn, fn);
+        return WEECHAT_RC_ERROR;
     }
 
-    weechat_infolist_free (infolist);
+    char *crc32 = cksum_get_crc32 (globals->re_crc32, fn);
+    if (crc32) {
+        cksum_xfer_t *xfer = cksum_xfers_find(lfn);
+        if (xfer) { /* The md5 was received already, so lets not do anything. */
+            weechat_printf(NULL, "%sxfer finished, md5 already reported.",
+                           CKSUM_PREFIX);
+            cksum_xfers_remove(xfer);
+        } else { /* Ok, md5 not received yet. Let's wait for one */
+            weechat_printf(NULL, "%sxfer (%s) finished, waiting for md5...",
+                           CKSUM_PREFIX, lfn);
+            xfer = cksum_xfer_new(lfn, crc32, fn);
+            if (xfer) {
+                struct t_hook *hook = weechat_hook_timer(5000, 0, 1,
+                                                         &cksum_cb_timer,
+                                                         xfer, NULL);
+                if (hook) {
+                    xfer->timer = hook;
+                    cksum_xfers_add(xfer);
+                } else {
+                    weechat_printf(NULL, "%s%sUnable to setup timer to check crc32",
+                                   weechat_prefix("error"), CKSUM_PREFIX);
+                    cksum_xfer_free(xfer);
+                }
+            }
+        }
+        free (crc32);
+    }
 
     return WEECHAT_RC_OK;
 }
